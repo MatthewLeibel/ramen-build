@@ -1,0 +1,161 @@
+name: windows
+
+# Build the RAMen Windows packages (CPU and NVIDIA), then install and test them on a clean Windows machine the way a
+# customer would: the PowerShell installer, ramen start, a chat, ramen stop, a restart that must restore the chat.
+#
+# This repository is public so the builds use GitHub's free runners for public projects. It holds no source code:
+# the build fetches RAMen's private repository with a read-only deploy key (secret CONTEXT_ENGINE_KEY) that is not
+# kept after the checkout. Only the owner can start a build (manual runs only; fork pull requests get no secrets).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "which commit, branch or tag of RAMen to build"
+        default: "main"
+      cuda:
+        description: "CUDA toolkit version"
+        default: "12.8.1"
+      packages:
+        description: "which packages to build (JSON list of matrix entries; default: all three)"
+        default: '[{"name":"windows-x64-cpu","cuda":false,"vulkan":false},{"name":"windows-x64-cuda","cuda":true,"vulkan":false},{"name":"windows-x64-vulkan","cuda":false,"vulkan":true}]'
+
+env:
+  LLAMA_TAG: v0.9.0
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # cpu, cuda (NVIDIA) and vulkan (AMD and Intel graphics cards); the "packages" input can pick a subset
+        include: ${{ fromJSON(inputs.packages) }}
+    runs-on: windows-2022
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MatthewLeibel/context-engine
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CONTEXT_ENGINE_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: CUDA toolkit
+        if: matrix.cuda
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: ${{ inputs.cuda }}
+          method: local
+
+      - name: Vulkan SDK
+        if: matrix.vulkan
+        shell: pwsh
+        run: |
+          $v = '1.4.313.2'
+          curl.exe -sSfL -o "$env:RUNNER_TEMP\vk.exe" "https://sdk.lunarg.com/sdk/download/$v/windows/vulkansdk-windows-X64-$v.exe"
+          & "$env:RUNNER_TEMP\vk.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$v"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$v\bin"
+
+      - name: llama.cpp with the RAMen patch
+        shell: bash
+        run: |
+          git clone -q --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp
+          python release2/apply_patch.py llama.cpp
+
+      - name: Build llama-server
+        shell: bash
+        run: |
+          # no OpenSSL: RAMen talks to llama-server on this computer only, and a customer's computer may have no
+          # OpenSSL DLLs, or other versions of them (from Git or Anaconda), which crash it with 0xC0000139
+          ARGS="-DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF"
+          ARGS="$ARGS -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON"
+          if [ "${{ matrix.cuda }}" = "true" ]; then
+            # NO_VMM: no direct link to the driver DLL, so the package also starts (on the CPU) where no driver is installed
+            ARGS="$ARGS -DGGML_CUDA=ON -DGGML_CUDA_NO_VMM=ON -DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;120-real;120-virtual"
+          fi
+          if [ "${{ matrix.vulkan }}" = "true" ]; then ARGS="$ARGS -DGGML_VULKAN=ON"; fi
+          cmake -S llama.cpp -B build $ARGS
+          cmake --build build --config Release -j 4 --target llama-server
+
+      - name: The ramen app
+        shell: bash
+        run: |
+          python -m pip install -q pyinstaller==6.11.1
+          python -m PyInstaller --onedir --name ramen --paths ce-server --collect-submodules ce_server --console \
+              --distpath app --workpath pyi --specpath pyi --log-level WARN ce-server/ramen_entry.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $p = "pkg\ramen"; New-Item -ItemType Directory -Force "$p\bin" | Out-Null
+          Copy-Item app\ramen\* "$p\bin" -Recurse
+          Copy-Item build\bin\Release\llama-server.exe "$p\bin"
+          # the Visual C++ runtime and OpenMP DLLs llama-server uses, next to it (a customer's may be missing or older)
+          foreach ($dll in 'msvcp140.dll','msvcp140_1.dll','msvcp140_2.dll','msvcp140_atomic_wait.dll','vcruntime140.dll','vcruntime140_1.dll','vcomp140.dll','concrt140.dll') {
+            Copy-Item "$env:WINDIR\System32\$dll" "$p\bin" -ErrorAction SilentlyContinue }
+          if (-not (Test-Path "$p\bin\vcomp140.dll")) { throw "vcomp140.dll (OpenMP) not found on the build machine" }
+          if ("${{ matrix.cuda }}" -eq "true") {
+            foreach ($dll in 'cudart64_12.dll','cublas64_12.dll','cublasLt64_12.dll') {
+              $f = Get-ChildItem -Recurse "$env:CUDA_PATH\bin" -Filter $dll | Select-Object -First 1
+              if (-not $f) { throw "missing $dll" }
+              Copy-Item $f.FullName "$p\bin" }
+            "This package includes NVIDIA CUDA runtime libraries (cudart, cuBLAS, cuBLASLt), redistributed under the`nNVIDIA CUDA Toolkit End User License Agreement: https://docs.nvidia.com/cuda/eula/" | Set-Content "$p\CUDA-NOTICE.txt"
+          }
+          Copy-Item llama.cpp\LICENSE "$p\LICENSE-llama.cpp.txt"
+          Copy-Item legal\EULA.md "$p\EULA.md"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path pkg\ramen -DestinationPath "dist\${{ matrix.name }}.zip" -CompressionLevel Optimal
+          (Get-FileHash "dist\${{ matrix.name }}.zip" -Algorithm SHA256).Hash.ToLower() | Set-Content -NoNewline "dist\${{ matrix.name }}.zip.sha256"
+          Get-ChildItem dist, "$p\bin" | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Every DLL the programs load is part of Windows or in the package
+        shell: bash
+        run: |
+          python -m pip install -q pefile
+          python release/check_windows_deps.py pkg/ramen/bin ${{ matrix.cuda && '--cuda' || '' }} ${{ matrix.vulkan && '--vulkan' || '' }}
+
+      - name: Install and test like a customer
+        shell: pwsh
+        run: |
+          $env:RAMEN_PKG = (Resolve-Path "dist\${{ matrix.name }}.zip").Path
+          ./install.ps1
+          $bin = Join-Path $env:LOCALAPPDATA 'Programs\RAMen\bin'
+          $env:Path = "$bin;$env:Path"
+          ramen version
+          ramen models
+          $m = Join-Path $env:RUNNER_TEMP 'q.gguf'
+          Invoke-WebRequest https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf -OutFile $m -UseBasicParsing
+          ramen start $m --ctx 8192 --slots 1
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:USERPROFILE\.context-engine\*.log" -Tail 60; throw "ramen start failed" }
+          ramen status
+          $body = '{"messages":[{"role":"system","content":"You are a helpful assistant. You answer briefly."},{"role":"user","content":"Name three kinds of noodles."}],"max_tokens":24,"temperature":0}'
+          $r1 = Invoke-WebRequest -Uri http://127.0.0.1:8090/v1/chat/completions -Method Post -ContentType 'application/json' -Body $body -UseBasicParsing
+          "first chat: $($r1.Headers['X-CE-Cache']) $(($r1.Content | ConvertFrom-Json).choices[0].message.content)"
+          ramen stop
+          ramen start $m --ctx 8192 --slots 1
+          $r2 = Invoke-WebRequest -Uri http://127.0.0.1:8090/v1/chat/completions -Method Post -ContentType 'application/json' -Body $body -UseBasicParsing
+          $how = "$($r2.Headers['X-CE-Cache'])"
+          "second chat after restart: $how"
+          ramen connect env
+          ramen stop
+          Get-Content "$env:USERPROFILE\.context-engine\llama-server.log" -Tail 25
+          if ($how -ne 'restored') { throw "the chat was not restored after a restart ($how)" }
+          if (Select-String -Path "$env:USERPROFILE\.context-engine\*.log" -Pattern 'needs a licensed RAMen' -Quiet) { throw 'the engine did not accept the unlock' }
+          "WINDOWS TEST PASSED"
+
+      - name: Big-model engine test (a mixture-of-experts model gives the same answers with the speedups on and off)
+        if: ${{ !matrix.cuda }}
+        shell: bash
+        run: |
+          curl -sfL -o "$RUNNER_TEMP/olmoe.gguf" https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct-GGUF/resolve/main/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf
+          python release2/test_moe.py build/bin/Release/llama-server.exe "$RUNNER_TEMP/olmoe.gguf" --cache-gb 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ramen-${{ matrix.name }}
+          path: dist/*
+          retention-days: 14

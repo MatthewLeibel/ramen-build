@@ -1,7 +1,8 @@
 name: web
 
 # Build RAMen in the browser (the phone web app: llama.cpp in WebAssembly with RAMen's session memory) and test it
-# in Chromium and WebKit: the model downloads into the browser's storage, a chat is answered and saved, the page is
+# in Chromium (Linux) and in real Safari (macOS, through safaridriver; the Linux WebKit build has no origin private
+# file system): the model downloads into the browser's storage, a chat is answered and saved, the page is
 # closed, and in a new page the chat must come back from its memory file and read only the new message.
 #
 # Same rules as the other workflows: this public repository holds no source code; the build fetches RAMen's private
@@ -55,13 +56,13 @@ jobs:
           curl -sfL -o web/app/model/model.gguf "$MODEL_URL"
           echo "$MODEL_SHA  web/app/model/model.gguf" | sha256sum -c
           cd web/test && npm init -y > /dev/null && npm install --silent playwright@1.49.1 > /dev/null
-          npx playwright install --with-deps chromium webkit > "$RUNNER_TEMP/pw.log" 2>&1 || { tail -20 "$RUNNER_TEMP/pw.log"; exit 1; }
+          npx playwright install --with-deps chromium > "$RUNNER_TEMP/pw.log" 2>&1 || { tail -20 "$RUNNER_TEMP/pw.log"; exit 1; }
 
-      - name: In Chromium and WebKit, a chat comes back after the page was closed
+      - name: In Chromium, a chat comes back after the page was closed
         run: |
           (cd web/app && python3 -m http.server 8123 > "$RUNNER_TEMP/http.log" 2>&1 &)
           sleep 2
-          cd web/test && BASE=http://localhost:8123 node pwa.test.mjs
+          cd web/test && BASE=http://localhost:8123 BROWSERS=chromium node pwa.test.mjs
 
       - name: The web app as it would be published
         run: |
@@ -73,3 +74,34 @@ jobs:
           name: ramen-web-app
           path: web/app
           retention-days: 14
+
+  safari:
+    needs: web
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MatthewLeibel/context-engine
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CONTEXT_ENGINE_KEY }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ramen-web-app
+          path: web/app
+
+      - name: Test model, Safari's driver
+        run: |
+          mkdir -p web/app/model
+          curl -sfL -o web/app/model/model.gguf "$MODEL_URL"
+          echo "$MODEL_SHA  web/app/model/model.gguf" | shasum -a 256 -c
+          sudo safaridriver --enable
+          python3 -m pip install --quiet --break-system-packages selenium==4.27.1 || python3 -m pip install --quiet selenium==4.27.1
+
+      - name: In Safari, a chat comes back after the tab was closed
+        run: |
+          (cd web/app && python3 -m http.server 8123 > "$RUNNER_TEMP/http.log" 2>&1 &)
+          sleep 2
+          cd web/test && BASE=http://localhost:8123 python3 safari_test.py

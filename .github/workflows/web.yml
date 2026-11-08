@@ -1,0 +1,75 @@
+name: web
+
+# Build RAMen in the browser (the phone web app: llama.cpp in WebAssembly with RAMen's session memory) and test it
+# in Chromium and WebKit: the model downloads into the browser's storage, a chat is answered and saved, the page is
+# closed, and in a new page the chat must come back from its memory file and read only the new message.
+#
+# Same rules as the other workflows: this public repository holds no source code; the build fetches RAMen's private
+# repository with a read-only deploy key (secret CONTEXT_ENGINE_KEY). Build logs stay on the runner; only result and
+# error lines are printed. Manual runs only. The artifact is the web app as it would be published.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "which commit, branch or tag of RAMen to build"
+        default: "main"
+
+env:
+  LLAMA_TAG: v0.9.0
+  MODEL_URL: https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf
+  MODEL_BYTES: "396705472"
+  MODEL_SHA: ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a
+
+jobs:
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MatthewLeibel/context-engine
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CONTEXT_ENGINE_KEY }}
+          persist-credentials: false
+
+      - name: Emscripten and llama.cpp
+        run: |
+          git clone -q --depth 1 https://github.com/emscripten-core/emsdk "$RUNNER_TEMP/emsdk"
+          (cd "$RUNNER_TEMP/emsdk" && ./emsdk install latest > /dev/null && ./emsdk activate latest > /dev/null)
+          source "$RUNNER_TEMP/emsdk/emsdk_env.sh" > /dev/null
+          emcc --version | head -1
+          git clone -q --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp "$RUNNER_TEMP/llama.cpp"
+          sudo apt-get install -y -qq ninja-build > /dev/null
+
+      - name: Build the engine (ramen.js, ramen.wasm)
+        run: |
+          source "$RUNNER_TEMP/emsdk/emsdk_env.sh" > /dev/null
+          if ! bash web/build.sh "$RUNNER_TEMP/llama.cpp" > "$RUNNER_TEMP/build.log" 2>&1; then
+            grep -E "error:|Error|FAILED|undefined symbol" "$RUNNER_TEMP/build.log" | head -40; exit 1
+          fi
+          tail -2 "$RUNNER_TEMP/build.log"
+
+      - name: Test model and the browsers
+        run: |
+          mkdir -p web/app/model
+          curl -sfL -o web/app/model/model.gguf "$MODEL_URL"
+          echo "$MODEL_SHA  web/app/model/model.gguf" | sha256sum -c
+          cd web/test && npm init -y > /dev/null && npm install --silent playwright@1.49.1 > /dev/null
+          npx playwright install --with-deps chromium webkit > "$RUNNER_TEMP/pw.log" 2>&1 || { tail -20 "$RUNNER_TEMP/pw.log"; exit 1; }
+
+      - name: In Chromium and WebKit, a chat comes back after the page was closed
+        run: |
+          (cd web/app && python3 -m http.server 8123 > "$RUNNER_TEMP/http.log" 2>&1 &)
+          sleep 2
+          cd web/test && BASE=http://localhost:8123 node pwa.test.mjs
+
+      - name: The web app as it would be published
+        run: |
+          rm -rf web/app/model
+          ls -la web/app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ramen-web-app
+          path: web/app
+          retention-days: 14

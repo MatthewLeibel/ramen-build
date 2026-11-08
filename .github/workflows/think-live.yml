@@ -1,0 +1,87 @@
+name: think-live
+
+# A real thinking model under a tight token limit, before and after RAMen 1.4.0's thinking budget: Qwen3 0.6B with
+# thinking on, asked a question with max_tokens 300. Plain llama-server may spend all 300 tokens thinking (no answer);
+# through RAMen the thinking is closed with Qwen's sentence and an answer follows. Built the same way as mac.yml.
+# Same rules as the other workflows: no source here; only result lines are printed. Manual runs only.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "which commit, branch or tag of RAMen to build"
+        default: "main"
+
+env:
+  LLAMA_TAG: v0.9.0
+  MACOSX_DEPLOYMENT_TARGET: "13.3"
+
+jobs:
+  think:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MatthewLeibel/context-engine
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CONTEXT_ENGINE_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: llama.cpp with the RAMen patch, llama-server
+        run: |
+          git clone -q --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp
+          python release2/apply_patch.py llama.cpp > /dev/null
+          cmake -S llama.cpp -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF \
+              -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DCMAKE_OSX_ARCHITECTURES=arm64 > "$RUNNER_TEMP/cmake.log" 2>&1
+          cmake --build build -j "$(sysctl -n hw.ncpu)" --target llama-server > "$RUNNER_TEMP/build.log" 2>&1 \
+            || { grep -E "error:" "$RUNNER_TEMP/build.log" | head -20; exit 1; }
+          ls -la build/bin/llama-server
+
+      - name: The ramen app, installed like a customer
+        run: |
+          python -m pip install -q pyinstaller==6.11.1
+          python -m PyInstaller --onefile --name ramen --paths ce-server --collect-submodules ce_server \
+              --distpath app --workpath pyi --specpath pyi --log-level WARN ce-server/ramen_entry.py > /dev/null 2>&1
+          mkdir -p pkg/ramen/bin dist
+          cp build/bin/llama-server app/ramen pkg/ramen/bin/
+          cp llama.cpp/LICENSE pkg/ramen/LICENSE-llama.cpp.txt
+          cp legal/EULA.md pkg/ramen/EULA.md
+          tar -C pkg -czf dist/ramen-macos-arm64.tar.gz ramen
+          RAMEN_PKG="$PWD/dist/ramen-macos-arm64.tar.gz" bash install.sh > /dev/null
+          "$HOME/.ramen/bin/ramen" version
+
+      - name: Before and after, a tight limit on a thinking model
+        run: |
+          curl -sfL -o "$RUNNER_TEMP/q.gguf" https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf
+          cat > "$RUNNER_TEMP/ask.py" <<'PY'
+          import json, sys, urllib.request
+          url, label = sys.argv[1], sys.argv[2]
+          body = {"model": "m", "max_tokens": 300, "temperature": 0.6, "top_p": 0.95, "top_k": 20, "seed": 7,
+                  "chat_template_kwargs": {"enable_thinking": True},
+                  "messages": [{"role": "user", "content": "A shop sells pens at 3 for 2 dollars. How much do 27 pens cost? Explain briefly."}]}
+          req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+          with urllib.request.urlopen(req, timeout=600) as r:
+              out, budget = json.loads(r.read()), r.headers.get("X-CE-Thinking-Budget")
+          m = out["choices"][0]["message"]
+          think, answer = m.get("reasoning_content") or "", (m.get("content") or "").strip()
+          print(f"{label}: finish={out['choices'][0].get('finish_reason')} tokens={out.get('usage', {}).get('completion_tokens')} "
+                f"thinking_chars={len(think)} closed_with_qwen_sentence={'limited time by the user' in think} budget={budget}")
+          print(f"{label} answer: {answer[:300]!r}")
+          print(f"RESULT {label} {'ANSWER' if answer else 'NO_ANSWER'}")
+          PY
+          build/bin/llama-server -m "$RUNNER_TEMP/q.gguf" --port 8195 -c 8192 -fa on --jinja > "$RUNNER_TEMP/plain.log" 2>&1 &
+          for i in $(seq 1 120); do curl -sf http://127.0.0.1:8195/health > /dev/null && break; sleep 1; done
+          python "$RUNNER_TEMP/ask.py" http://127.0.0.1:8195 plain | tee before.txt
+          kill %1 || true
+          export PATH="$HOME/.ramen/bin:$PATH"
+          ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1 > /dev/null || { tail -40 ~/.context-engine/*.log; exit 1; }
+          python "$RUNNER_TEMP/ask.py" http://127.0.0.1:8090 ramen | tee after.txt
+          ramen stop > /dev/null
+          grep -q "RESULT ramen ANSWER" after.txt || { echo "THINK TEST FAILED: no answer through RAMen"; exit 1; }
+          grep -q "budget=None" after.txt && { echo "THINK TEST FAILED: RAMen gave no thinking budget"; exit 1; }
+          echo "THINK TEST PASSED"

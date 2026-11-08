@@ -1,0 +1,132 @@
+name: android
+
+# Build RAMen for Android, the phone kit (com.getramenai:ramen), and test it the way an app maker would: a blank app
+# with only the kit's two snippets answers on an emulator, Android closes the app, and the next message must find the
+# conversation restored from its memory file, reading only the new message. The RAMen app must still build on the kit.
+#
+# Same rules as windows.yml and mac.yml: this repository is public so the builds use GitHub's free runners for public
+# projects. It holds no source code: the build fetches RAMen's private repository with a read-only deploy key (secret
+# CONTEXT_ENGINE_KEY) that is not kept after the checkout. Build logs stay on the runner; only result and error lines
+# are printed (the compiler is told not to print source lines). Only the owner can start a build (manual runs only).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "which commit, branch or tag of RAMen to build"
+        default: "main"
+
+env:
+  LLAMA_TAG: v0.9.0
+  NDK_VERSION: 27.3.13750724
+  KIT_VERSION: 0.9.0
+
+jobs:
+  kit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MatthewLeibel/context-engine
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CONTEXT_ENGINE_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android NDK, CMake and platform
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "ndk;$NDK_VERSION" "cmake;3.22.1" "platforms;android-36" > "$RUNNER_TEMP/sdk.log" 2>&1 \
+            || { tail -20 "$RUNNER_TEMP/sdk.log"; exit 1; }
+          ls "$ANDROID_HOME/ndk"
+
+      - name: llama.cpp with the RAMen patch
+        run: |
+          git clone -q --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp "$RUNNER_TEMP/llama.cpp"
+          bash mobile/android/scripts/patch_llama.sh "$RUNNER_TEMP/llama.cpp" mobile/android-llama.cpp
+
+      - name: Build the kit and its unit tests, and the RAMen app on it
+        working-directory: mobile/android
+        run: |
+          quiet() {  # $1: name, then the command. The full log stays on the runner.
+            local name=$1; shift
+            if ! "$@" > "$RUNNER_TEMP/$name.log" 2>&1; then
+              grep -E "^e: |error:|FAILED|What went wrong|Could not|> Task .*FAILED|tests completed|Exception" "$RUNNER_TEMP/$name.log" \
+                | grep -vE "^[[:space:]]+at " | head -60
+              echo "$name: BUILD FAILED"; exit 1
+            fi
+            grep -E "BUILD SUCCESSFUL|tests completed" "$RUNNER_TEMP/$name.log" | tail -2
+          }
+          quiet kit ./gradlew --no-daemon --console=plain -Pramen.abis=arm64-v8a,x86_64 \
+              :ramen:testReleaseUnitTest :ramen:publishReleasePublicationToKitRepository
+          quiet app ./gradlew --no-daemon --console=plain -Pramen.abis=arm64-v8a,x86_64 :app:assembleDebug
+          find ramen/build/repo -type f | sort
+          ls -la app/build/outputs/apk/debug/
+
+      - name: The kit's native libraries (both ABIs, 16 KB pages)
+        working-directory: mobile/android
+        run: |
+          RE="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          aar=ramen/build/repo/com/getramenai/ramen/$KIT_VERSION/ramen-$KIT_VERSION.aar
+          ls -la "$aar"
+          rm -rf "$RUNNER_TEMP/aar" && mkdir -p "$RUNNER_TEMP/aar" && unzip -q "$aar" -d "$RUNNER_TEMP/aar"
+          bad=0
+          for so in "$RUNNER_TEMP"/aar/jni/*/*.so; do
+            align=$("$RE" -lW "$so" | awk '$1=="LOAD"{print $NF}' | sort -u | tr '\n' ' ')
+            echo "$(basename "$(dirname "$so")")/$(basename "$so") $(stat -c %s "$so") bytes, LOAD align: $align"
+            for a in $align; do [ $((a)) -ge 16384 ] || bad=1; done
+          done
+          for abi in arm64-v8a x86_64; do
+            ls "$RUNNER_TEMP/aar/jni/$abi/libramen.so" "$RUNNER_TEMP/aar/jni/$abi/libc++_shared.so" > /dev/null
+            n=$(ls "$RUNNER_TEMP/aar/jni/$abi/" | grep -c '^libggml-cpu-' || true)
+            echo "$abi: $n CPU builds"; [ "$n" -ge 2 ] || bad=1
+          done
+          [ "$bad" = 0 ] || { echo "a library is not 16 KB aligned, or an ABI is missing its CPU builds"; exit 1; }
+
+      - name: A blank app with only the two snippets
+        working-directory: mobile/android/samples/hello
+        run: |
+          repo="file://$GITHUB_WORKSPACE/mobile/android/ramen/build/repo"
+          if ! ./gradlew --no-daemon --console=plain -Pramen.repo="$repo" :app:assembleDebug :app:assembleDebugAndroidTest \
+              > "$RUNNER_TEMP/hello.log" 2>&1; then
+            grep -E "^e: |error:|FAILED|What went wrong|Could not" "$RUNNER_TEMP/hello.log" | head -40; exit 1
+          fi
+          ls -la app/build/outputs/apk/debug/ app/build/outputs/apk/androidTest/debug/
+          # Android keeps the libraries inside this app's APK (no useLegacyPackaging): the kit must find its CPU build there
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -E "lib/x86_64/libggml-cpu" | head -3
+
+      - name: Test model (Qwen3 0.6B)
+        run: |
+          curl -sfL -o "$RUNNER_TEMP/model.gguf" \
+            https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf
+          ls -la "$RUNNER_TEMP/model.gguf"
+
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: On an emulator, the conversation comes back after Android closed the app
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          ram-size: 4096M
+          disk-size: 6000M
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          working-directory: mobile/android/samples/hello
+          script: bash ci_emulator_test.sh "$RUNNER_TEMP/model.gguf"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ramen-android-kit-${{ env.KIT_VERSION }}
+          path: mobile/android/ramen/build/repo
+          retention-days: 14

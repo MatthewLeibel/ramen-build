@@ -1,0 +1,65 @@
+name: kit-live
+
+# RAMen for Android as an app maker gets it: a blank app with only the two snippets, its kit downloaded from the
+# public address (https://getramenai.com/maven), answers on an emulator, Android closes the app, and the next message
+# must find the conversation restored from its memory file, reading only the new message.
+# Same rules as the other workflows: no source here; the sample and its test come from the private repository with a
+# read-only deploy key; only result lines are printed. Manual runs only.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "which commit, branch or tag of RAMen to take the sample app from"
+        default: "main"
+
+jobs:
+  live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MatthewLeibel/context-engine
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CONTEXT_ENGINE_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: The blank app, with the kit from getramenai.com/maven
+        working-directory: mobile/android/samples/hello
+        run: |
+          grep -n "getramenai.com/maven" settings.gradle.kts
+          if ! ./gradlew --no-daemon --console=plain --refresh-dependencies :app:assembleDebug :app:assembleDebugAndroidTest \
+              > "$RUNNER_TEMP/hello.log" 2>&1; then
+            grep -E "^e: |error:|FAILED|What went wrong|Could not" "$RUNNER_TEMP/hello.log" | head -40; exit 1
+          fi
+          grep -E "getramenai.com/maven|Download" "$RUNNER_TEMP/hello.log" | grep -i ramen | head -5 || true
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -c "lib/x86_64/libggml-cpu"
+
+      - name: Test model (Qwen3 0.6B)
+        run: |
+          curl -sfL -o "$RUNNER_TEMP/model.gguf" https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf
+          ls -la "$RUNNER_TEMP/model.gguf"
+
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: On an emulator, the conversation comes back after Android closed the app
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          ram-size: 4096M
+          disk-size: 6000M
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          working-directory: mobile/android/samples/hello
+          script: bash ci_emulator_test.sh "$RUNNER_TEMP/model.gguf"

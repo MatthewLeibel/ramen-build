@@ -1,0 +1,103 @@
+name: mac
+
+# Build the RAMen Mac package (Apple silicon), then install and test it on a clean Mac the way a customer would: the
+# installer, ramen start, a chat, ramen stop, a restart that must restore the chat.
+#
+# Same rules as windows.yml: this repository is public so the builds use GitHub's free runners for public projects.
+# It holds no source code: the build fetches RAMen's private repository with a read-only deploy key (secret
+# CONTEXT_ENGINE_KEY) that is not kept after the checkout. Only the owner can start a build (manual runs only).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "which commit, branch or tag of RAMen to build"
+        default: "main"
+
+env:
+  LLAMA_TAG: v0.9.0
+  MACOSX_DEPLOYMENT_TARGET: "13.3"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MatthewLeibel/context-engine
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CONTEXT_ENGINE_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: llama.cpp with the RAMen patch
+        run: |
+          git clone -q --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp
+          python release2/apply_patch.py llama.cpp
+
+      - name: Build llama-server (static, Metal shaders inside, macOS 13.3 and newer)
+        run: |
+          cmake -S llama.cpp -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+              -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DCMAKE_OSX_ARCHITECTURES=arm64
+          cmake --build build -j "$(sysctl -n hw.ncpu)" --target llama-server
+
+      - name: The ramen app
+        run: |
+          python -m pip install -q pyinstaller==6.11.1
+          python -m PyInstaller --onefile --name ramen --paths ce-server --collect-submodules ce_server \
+              --distpath app --workpath pyi --specpath pyi --log-level WARN ce-server/ramen_entry.py
+
+      - name: Package
+        run: |
+          mkdir -p pkg/ramen/bin dist
+          cp build/bin/llama-server app/ramen pkg/ramen/bin/
+          cp llama.cpp/LICENSE pkg/ramen/LICENSE-llama.cpp.txt
+          cp legal/EULA.md pkg/ramen/EULA.md
+          tar -C pkg -czf dist/ramen-macos-arm64.tar.gz ramen
+          shasum -a 256 dist/ramen-macos-arm64.tar.gz | awk '{print $1}' > dist/ramen-macos-arm64.tar.gz.sha256
+          ls -la dist
+
+      - name: Only the system's libraries, and macOS 13.3 or newer
+        run: |
+          for f in pkg/ramen/bin/llama-server pkg/ramen/bin/ramen; do
+            echo "$f links to:"; otool -L "$f" | tail -n +2
+            bad=$(otool -L "$f" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/|/System/Library/)' || true)
+            [ -z "$bad" ] || { echo "links to libraries a customer's Mac does not have: $bad"; exit 1; }
+            minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+            echo "$f minimum macOS: $minos"
+            python -c "import sys; v=tuple(int(x) for x in '$minos'.split('.')); sys.exit(0 if v <= (13, 3) else 1)" \
+              || { echo "needs macOS $minos, newer than 13.3"; exit 1; }
+          done
+
+      - name: Install and test like a customer
+        run: |
+          export RAMEN_PKG="$PWD/dist/ramen-macos-arm64.tar.gz"
+          bash install.sh
+          export PATH="$HOME/.ramen/bin:$PATH"
+          ramen version
+          curl -sfL -o "$RUNNER_TEMP/q.gguf" https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf
+          ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1 || { tail -60 ~/.context-engine/*.log; exit 1; }
+          ramen status
+          body='{"messages":[{"role":"system","content":"You are a helpful assistant. You answer briefly."},{"role":"user","content":"Name three kinds of noodles."}],"max_tokens":24,"temperature":0}'
+          curl -sf -D h1.txt -o r1.json -H 'Content-Type: application/json' -d "$body" http://127.0.0.1:8090/v1/chat/completions
+          echo "first chat: $(grep -i x-ce-cache h1.txt | tr -d '\r') $(python -c 'import json; print(json.load(open("r1.json"))["choices"][0]["message"]["content"])')"
+          ramen stop
+          ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1
+          curl -sf -D h2.txt -o r2.json -H 'Content-Type: application/json' -d "$body" http://127.0.0.1:8090/v1/chat/completions
+          how=$(grep -i x-ce-cache h2.txt | awk '{print $2}' | tr -d '\r')
+          echo "second chat after restart: $how"
+          ramen stop
+          tail -25 ~/.context-engine/llama-server.log
+          [ "$how" = "restored" ] || { echo "the chat was not restored after a restart ($how)"; exit 1; }
+          if grep -q 'needs a licensed RAMen' ~/.context-engine/*.log; then echo 'the engine did not accept the unlock'; exit 1; fi
+          echo "MAC TEST PASSED"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ramen-macos-arm64
+          path: dist/*
+          retention-days: 14

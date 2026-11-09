@@ -81,6 +81,15 @@ jobs:
           bash install.sh
           export PATH="$HOME/.ramen/bin:$PATH"
           ramen version
+          # HTTPS from the app as on a customer's Mac: the build's Python looks for certificates in this runner's
+          # folder, which customers do not have (1.4.0 test builds could not download or activate, 9 Nov 2026)
+          cafile=$(python -c 'import ssl; print(ssl.get_default_verify_paths().openssl_cafile)')
+          capath=$(python -c 'import ssl; print(ssl.get_default_verify_paths().openssl_capath)')
+          for p in "$cafile" "$capath"; do if [ -e "$p" ]; then sudo mv "$p" "$p.hidden"; fi; done
+          lic=$(ramen activate RAMEN-PRO-00000000-TEST --data-dir "$RUNNER_TEMP/lic" 2>&1 || true)
+          for p in "$cafile" "$capath"; do if [ -e "$p.hidden" ]; then sudo mv "$p.hidden" "$p"; fi; done
+          echo "license server without the runner's certificates: $lic"
+          case "$lic" in *"not found"*) ;; *) echo "FAILED: HTTPS from the app"; exit 1;; esac
           curl -sfL -o "$RUNNER_TEMP/q.gguf" https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf
           ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1 || { tail -60 ~/.context-engine/*.log; exit 1; }
           ramen status

@@ -3,6 +3,8 @@ name: think-live
 # A real thinking model under a tight token limit, before and after RAMen 1.4.0's thinking budget: Qwen3 0.6B with
 # thinking on, asked a question with max_tokens 300. Plain llama-server may spend all 300 tokens thinking (no answer);
 # through RAMen the thinking is closed with Qwen's sentence and an answer follows. Built the same way as mac.yml.
+# Then short limits: 24 tokens on the same model (RAMen asks it not to think, so it answers at once) and on
+# Qwen3 4B Thinking 2507, which always thinks (24 and 300 tokens): each must give an answer.
 # Same rules as the other workflows: no source here; only result lines are printed. Manual runs only.
 on:
   workflow_dispatch:
@@ -85,3 +87,35 @@ jobs:
           grep -q "RESULT ramen ANSWER" after.txt || { echo "THINK TEST FAILED: no answer through RAMen"; exit 1; }
           grep -q "budget=None" after.txt && { echo "THINK TEST FAILED: RAMen gave no thinking budget"; exit 1; }
           echo "THINK TEST PASSED"
+
+      - name: Short limits, and a model that always thinks
+        run: |
+          cat > "$RUNNER_TEMP/ask2.py" <<'PY'
+          import json, sys, urllib.request
+          url, label, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          q = "Name three kinds of noodles." if limit < 100 else "A shop sells pens at 3 for 2 dollars. How much do 27 pens cost? Explain briefly."
+          body = {"model": "m", "max_tokens": limit, "temperature": 0.6, "top_p": 0.95, "top_k": 20, "seed": 7,
+                  "messages": [{"role": "user", "content": q}]}
+          req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+          with urllib.request.urlopen(req, timeout=900) as r:
+              out, budget = json.loads(r.read()), r.headers.get("X-CE-Thinking-Budget")
+          m = out["choices"][0]["message"]
+          think, answer = m.get("reasoning_content") or "", (m.get("content") or "").strip()
+          print(f"{label}: limit={limit} finish={out['choices'][0].get('finish_reason')} thinking_chars={len(think)} budget={budget}")
+          print(f"{label} answer: {answer[:300]!r}")
+          print(f"RESULT {label} {'ANSWER' if answer and not answer.lower().startswith(('okay, the user', 'okay, so')) else 'NO_ANSWER'}")
+          PY
+          export PATH="$HOME/.ramen/bin:$PATH"
+          ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1 > /dev/null || { tail -40 ~/.context-engine/*.log; exit 1; }
+          python "$RUNNER_TEMP/ask2.py" http://127.0.0.1:8090 hybrid-24 24 | tee -a short.txt
+          ramen stop > /dev/null
+          curl -sfL --retry 6 --retry-all-errors --retry-delay 20 -o "$RUNNER_TEMP/t.gguf" \
+              https://huggingface.co/unsloth/Qwen3-4B-Thinking-2507-GGUF/resolve/main/Qwen3-4B-Thinking-2507-Q4_K_M.gguf
+          ramen start "$RUNNER_TEMP/t.gguf" --ctx 8192 --slots 1 > /dev/null || { tail -40 ~/.context-engine/*.log; exit 1; }
+          python "$RUNNER_TEMP/ask2.py" http://127.0.0.1:8090 thinking-24 24 | tee -a short.txt
+          python "$RUNNER_TEMP/ask2.py" http://127.0.0.1:8090 thinking-300 300 | tee -a short.txt
+          ramen stop > /dev/null
+          for c in hybrid-24 thinking-24 thinking-300; do
+            grep -q "RESULT $c ANSWER" short.txt || { echo "SHORT TEST FAILED: $c gave no answer"; exit 1; }
+          done
+          echo "SHORT LIMIT TEST PASSED"

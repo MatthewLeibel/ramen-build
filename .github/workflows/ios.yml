@@ -40,6 +40,11 @@ jobs:
           cmake --version | head -1
           swift --version 2>&1 | head -1
 
+      - name: The kit's prompt and session rules (no model)
+        run: |
+          bash mobile/ios-kit/Tests/run.sh > "$RUNNER_TEMP/unit.log" 2>&1 || { grep -E "^FAIL|FAILED|error:|session name" "$RUNNER_TEMP/unit.log" | head -20; exit 1; }
+          grep -E "^ALL PASSED|session names" "$RUNNER_TEMP/unit.log"
+
       - name: llama.cpp (plain, no RAMen patch)
         run: git clone -q --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp "$RUNNER_TEMP/llama.cpp"
 

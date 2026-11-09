@@ -145,6 +145,25 @@ jobs:
           Get-Content "$env:USERPROFILE\.context-engine\llama-server.log" -Tail 25
           if ($how -ne 'restored') { throw "the chat was not restored after a restart ($how)" }
           if (Select-String -Path "$env:USERPROFILE\.context-engine\*.log" -Pattern 'needs a licensed RAMen' -Quiet) { throw 'the engine did not accept the unlock' }
+          # Sleep, the default (study and remember): a conversation with a fact, a night, then the question with the lookup
+          ramen start $m --ctx 8192 --slots 1
+          if ($LASTEXITCODE -ne 0) { throw "start for Sleep failed" }
+          $fact = '{"messages":[{"role":"user","content":"My cat is called Zorblax and she is 4 years old. What do cats like to play with?"}],"max_tokens":40,"temperature":0}'
+          Invoke-WebRequest -Uri http://127.0.0.1:8090/v1/chat/completions -Method Post -ContentType 'application/json' -Body $fact -UseBasicParsing | Out-Null
+          ramen stop
+          $t = Get-Date
+          ramen sleep
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:USERPROFILE\.context-engine\sleep\llama-server.log" -Tail 40; throw "ramen sleep failed" }
+          "Sleep took $([int]((Get-Date) - $t).TotalSeconds) s"
+          ramen sleep --status
+          ramen start $m --ctx 8192 --slots 1
+          $q = '{"messages":[{"role":"user","content":"What is my cat called?"}],"max_tokens":30,"temperature":0}'
+          $r3 = Invoke-WebRequest -Uri http://127.0.0.1:8090/v1/chat/completions -Method Post -ContentType 'application/json' -Body $q -UseBasicParsing
+          ramen stop
+          "after Sleep: notes $($r3.Headers['X-CE-Recall']) $(($r3.Content | ConvertFrom-Json).choices[0].message.content)"
+          if (-not $r3.Headers['X-CE-Recall']) { throw "Sleep: no notes went with the question" }
+          if ($r3.Content -notmatch 'Zorblax') { throw "Sleep: the answer does not have the cat's name" }
+          "SLEEP TEST PASSED"
           "WINDOWS TEST PASSED"
 
       - name: Big-model engine test (a mixture-of-experts model gives the same answers with the speedups on and off)

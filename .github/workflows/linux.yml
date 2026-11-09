@@ -85,31 +85,36 @@ jobs:
           echo "glibc needed by ramen: $(objdump -T app/ramen | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)"
 
       - name: Install and test like a customer
+        shell: bash
         run: |
+          set -uo pipefail
+          fail() { echo "FAILED: $1"; ps -eo pid,etime,args | grep -E 'ramen|llama' | grep -v grep; for f in ~/.context-engine/*.log; do echo "--- $f"; tail -40 "$f"; done; exit 1; }
           export RAMEN_PKG="$PWD/dist/ramen-linux-${{ matrix.arch }}-cpu.tar.gz"
-          bash install.sh
+          bash install.sh || fail "install"
           export PATH="$HOME/.ramen/bin:$PATH"
           ramen version
           curl -sfL --retry 6 --retry-all-errors --retry-delay 20 -o "$RUNNER_TEMP/q.gguf" \
-              https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf
-          ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1 || { tail -60 ~/.context-engine/*.log; exit 1; }
+              https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf || fail "model download"
+          ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1 || fail "first start"
           ramen status
           body='{"messages":[{"role":"system","content":"You are a helpful assistant. You answer briefly."},{"role":"user","content":"Name three kinds of noodles."}],"max_tokens":24,"temperature":0}'
-          curl -sf -D h1.txt -o r1.json -H 'Content-Type: application/json' -d "$body" http://127.0.0.1:8090/v1/chat/completions
-          echo "first chat: $(grep -i x-ce-cache h1.txt | tr -d '\r') $(python3 -c 'import json; print(json.load(open("r1.json"))["choices"][0]["message"]["content"])')"
-          ramen stop
-          ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1
-          curl -sf -D h2.txt -o r2.json -H 'Content-Type: application/json' -d "$body" http://127.0.0.1:8090/v1/chat/completions
+          curl -sf -D h1.txt -o r1.json -H 'Content-Type: application/json' -d "$body" http://127.0.0.1:8090/v1/chat/completions || fail "first chat"
+          echo "first chat: $(grep -i x-ce-cache h1.txt | tr -d '\r') $(head -c 700 r1.json)"
+          t=$(date +%s); out=$(ramen stop); echo "$out (after $(( $(date +%s) - t )) s)"
+          case "$out" in *"still saving"*) fail "ramen stop waited 3 minutes";; esac
+          ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1 || fail "second start"
+          curl -sf -D h2.txt -o r2.json -H 'Content-Type: application/json' -d "$body" http://127.0.0.1:8090/v1/chat/completions || fail "second chat"
           how=$(grep -i x-ce-cache h2.txt | awk '{print $2}' | tr -d '\r')
           echo "second chat after restart: $how"
-          ramen stop
+          out=$(ramen stop); echo "$out"
+          case "$out" in *"still saving"*) fail "the second ramen stop waited 3 minutes";; esac
           tail -25 ~/.context-engine/llama-server.log
-          [ "$how" = "restored" ] || { echo "the chat was not restored after a restart ($how)"; exit 1; }
-          if grep -q 'needs a licensed RAMen' ~/.context-engine/*.log; then echo 'the engine did not accept the unlock'; exit 1; fi
+          [ "$how" = "restored" ] || fail "the chat was not restored after a restart ($how)"
+          if grep -q 'needs a licensed RAMen' ~/.context-engine/*.log; then fail 'the engine did not accept the unlock'; fi
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
               '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' > mcp_in.txt
-          ramen mcp < mcp_in.txt > mcp_out.txt
-          python3 -c 'import json; r=[json.loads(l) for l in open("mcp_out.txt")]; n=[t["name"] for t in r[1]["result"]["tools"]]; print("connector:", r[0]["result"]["serverInfo"], n); assert {"recall","remember","memory_status"} <= set(n)'
+          ramen mcp < mcp_in.txt > mcp_out.txt || fail "ramen mcp"
+          python3 -c 'import json; r=[json.loads(l) for l in open("mcp_out.txt")]; n=[t["name"] for t in r[1]["result"]["tools"]]; print("connector:", r[0]["result"]["serverInfo"], n); assert {"recall","remember","memory_status"} <= set(n)' || fail "connector answers"
           echo "LINUX TEST PASSED"
 
       - uses: actions/upload-artifact@v4

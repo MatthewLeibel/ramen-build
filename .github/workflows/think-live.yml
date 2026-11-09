@@ -93,7 +93,7 @@ jobs:
           cat > "$RUNNER_TEMP/ask2.py" <<'PY'
           import json, sys, urllib.request
           url, label, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
-          q = "Name three kinds of noodles." if limit < 100 else "A shop sells pens at 3 for 2 dollars. How much do 27 pens cost? Explain briefly."
+          q = "Name three kinds of noodles." if limit < 100 else "Find every real x with x^4 - 13x^2 + 36 = 0. Check each one. Explain briefly."
           body = {"model": "m", "max_tokens": limit, "temperature": 0.6, "top_p": 0.95, "top_k": 20, "seed": 7,
                   "messages": [{"role": "user", "content": q}]}
           req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
@@ -101,7 +101,8 @@ jobs:
               out, budget = json.loads(r.read()), r.headers.get("X-CE-Thinking-Budget")
           m = out["choices"][0]["message"]
           think, answer = m.get("reasoning_content") or "", (m.get("content") or "").strip()
-          print(f"{label}: limit={limit} finish={out['choices'][0].get('finish_reason')} thinking_chars={len(think)} budget={budget}")
+          print(f"{label}: limit={limit} finish={out['choices'][0].get('finish_reason')} thinking_chars={len(think)} budget={budget} "
+                f"closed_with_qwen_sentence={'limited time by the user' in think}")
           print(f"{label} answer: {answer[:300]!r}")
           print(f"RESULT {label} {'ANSWER' if answer and not answer.lower().startswith(('okay, the user', 'okay, so')) else 'NO_ANSWER'}")
           PY

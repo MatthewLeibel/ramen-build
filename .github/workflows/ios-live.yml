@@ -1,0 +1,36 @@
+name: ios-live
+
+# The published RAMen kit for iPhone, as an app maker gets it: a blank app adds the Swift package from its public
+# address (https://github.com/MatthewLeibel/ramen-swift), Xcode downloads and checks the two frameworks, and the app
+# runs the kit test on the iPhone simulator (new conversation, in memory, restored after the app ends, forget).
+# Same rules as the other workflows: no source here; only result and error lines are printed. Manual runs only.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "which commit, branch or tag of RAMen holds the sample app"
+        default: "main"
+      version:
+        description: "the package version to test"
+        default: "0.9.0"
+
+jobs:
+  live:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MatthewLeibel/context-engine
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CONTEXT_ENGINE_KEY }}
+          persist-credentials: false
+
+      - name: Test model (Qwen3 0.6B) and XcodeGen
+        run: |
+          curl -sfL -o "$RUNNER_TEMP/model.gguf" https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf
+          brew install xcodegen > "$RUNNER_TEMP/brew.log" 2>&1 || { tail -5 "$RUNNER_TEMP/brew.log"; exit 1; }
+          xcodebuild -version | head -1
+
+      - name: A blank app with the published package, on the iPhone simulator
+        run: bash mobile/ios-kit/samples/Hello/ci_simulator_test.sh remote "https://github.com/MatthewLeibel/ramen-swift@${{ inputs.version }}" "$RUNNER_TEMP/model.gguf"

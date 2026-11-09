@@ -93,6 +93,10 @@ jobs:
           bash install.sh || fail "install"
           export PATH="$HOME/.ramen/bin:$PATH"
           ramen version
+          # HTTPS from the app (downloads, licenses): a fake key must reach the license server and be refused
+          lic=$(ramen activate RAMEN-PRO-00000000-TEST --data-dir "$RUNNER_TEMP/lic" 2>&1 || true)
+          echo "license server: $lic"
+          case "$lic" in *"not found"*) ;; *) fail "HTTPS from the app ($lic)";; esac
           curl -sfL --retry 6 --retry-all-errors --retry-delay 20 -o "$RUNNER_TEMP/q.gguf" \
               https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf || fail "model download"
           ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1 || fail "first start"

@@ -18,7 +18,7 @@ on:
 env:
   LLAMA_TAG: v0.9.0
   NDK_VERSION: 27.3.13750724
-  KIT_VERSION: 0.9.0
+  KIT_VERSION: 0.9.1
 
 jobs:
   kit:
@@ -45,10 +45,12 @@ jobs:
             || { tail -20 "$RUNNER_TEMP/sdk.log"; exit 1; }
           ls "$ANDROID_HOME/ndk"
 
-      - name: llama.cpp with the RAMen patch
+      - name: Plain llama.cpp (the published kit has no RAMen engine patch)
         run: |
           git clone -q --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp "$RUNNER_TEMP/llama.cpp"
-          bash mobile/android/scripts/patch_llama.sh "$RUNNER_TEMP/llama.cpp" mobile/android-llama.cpp
+          mkdir -p mobile/android-llama.cpp
+          (cd "$RUNNER_TEMP/llama.cpp" && tar -cf - --exclude ./.git .) | (cd mobile/android-llama.cpp && tar -xf -)
+          if grep -q "RAMen" mobile/android-llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c; then echo "not a plain llama.cpp"; exit 1; fi
 
       - name: Build the kit and its unit tests, and the RAMen app on it
         working-directory: mobile/android
@@ -87,6 +89,15 @@ jobs:
             echo "$abi: $n CPU builds"; [ "$n" -ge 2 ] || bad=1
           done
           [ "$bad" = 0 ] || { echo "a library is not 16 KB aligned, or an ABI is missing its CPU builds"; exit 1; }
+          # nothing of RAMen's engine inside: no RAMen functions in the llama.cpp libraries, no unlock code anywhere
+          NM="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          for so in "$RUNNER_TEMP"/aar/jni/*/libggml*.so "$RUNNER_TEMP"/aar/jni/*/libllama*.so; do
+            [ -f "$so" ] || continue
+            if "$NM" -D --defined-only "$so" | grep -qi "ramen"; then echo "$(basename "$so") has RAMen functions"; bad=1; fi
+            if grep -qa "LLAMA_CE_UNLOCK\|RAMEN_MOE" "$so"; then echo "$(basename "$so") reads RAMen's engine settings"; bad=1; fi
+          done
+          [ "$bad" = 0 ] || { echo "the kit must be built from plain llama.cpp"; exit 1; }
+          echo "plain llama.cpp inside: no RAMen engine functions or settings"
 
       - name: A blank app with only the two snippets
         working-directory: mobile/android/samples/hello

@@ -52,6 +52,15 @@ jobs:
           (cd "$RUNNER_TEMP/llama.cpp" && tar -cf - --exclude ./.git .) | (cd mobile/android-llama.cpp && tar -xf -)
           if grep -q "RAMen" mobile/android-llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c; then echo "not a plain llama.cpp"; exit 1; fi
 
+      - name: Gradle (its download server sometimes times out; try again with longer waits)
+        working-directory: mobile/android
+        run: |
+          for i in 1 2 3 4 5 6; do
+            if ./gradlew --no-daemon --version > "$RUNNER_TEMP/gradle-dl.log" 2>&1; then echo "Gradle ready"; exit 0; fi
+            grep -E "Exception|failed" "$RUNNER_TEMP/gradle-dl.log" | head -2; sleep $((i * 30))
+          done
+          exit 1
+
       - name: Build the kit and its unit tests, and the RAMen app on it
         working-directory: mobile/android
         run: |

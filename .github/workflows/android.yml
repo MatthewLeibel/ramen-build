@@ -64,14 +64,20 @@ jobs:
       - name: Build the kit and its unit tests, and the RAMen app on it
         working-directory: mobile/android
         run: |
-          quiet() {  # $1: name, then the command. The full log stays on the runner.
+          quiet() {  # $1: name, then the command. The full log stays on the runner. A failed download (GitHub's
+                     # file servers were answering 504) is tried again; Gradle keeps what it already downloaded.
             local name=$1; shift
-            if ! "$@" > "$RUNNER_TEMP/$name.log" 2>&1; then
+            for i in 1 2 3 4 5; do
+              if "$@" > "$RUNNER_TEMP/$name.log" 2>&1; then
+                grep -E "BUILD SUCCESSFUL|tests completed" "$RUNNER_TEMP/$name.log" | tail -2; return 0
+              fi
+              if [ "$i" -lt 5 ] && grep -qE "Could not (GET|HEAD|download|get resource)|Gateway Time-out|Read timed out|status code 50[234]" "$RUNNER_TEMP/$name.log"; then
+                echo "$name: a download failed (try $i), trying again"; sleep $((i * 60)); continue
+              fi
               grep -E "^e: |error:|FAILED|What went wrong|Could not|> Task .*FAILED|tests completed|Exception" "$RUNNER_TEMP/$name.log" \
                 | grep -vE "^[[:space:]]+at " | head -60
               echo "$name: BUILD FAILED"; exit 1
-            fi
-            grep -E "BUILD SUCCESSFUL|tests completed" "$RUNNER_TEMP/$name.log" | tail -2
+            done
           }
           quiet kit ./gradlew --no-daemon --console=plain -Pramen.abis=arm64-v8a,x86_64 \
               :ramen:testReleaseUnitTest :ramen:publishReleasePublicationToKitRepository
@@ -112,17 +118,21 @@ jobs:
         working-directory: mobile/android/samples/hello
         run: |
           repo="file://$GITHUB_WORKSPACE/mobile/android/ramen/build/repo"
-          if ! ./gradlew --no-daemon --console=plain -Pramen.repo="$repo" :app:assembleDebug :app:assembleDebugAndroidTest \
-              > "$RUNNER_TEMP/hello.log" 2>&1; then
+          for i in 1 2 3 4 5; do
+            ./gradlew --no-daemon --console=plain -Pramen.repo="$repo" :app:assembleDebug :app:assembleDebugAndroidTest \
+              > "$RUNNER_TEMP/hello.log" 2>&1 && break
+            if [ "$i" -lt 5 ] && grep -qE "Could not (GET|HEAD|download|get resource)|Gateway Time-out|Read timed out|status code 50[234]" "$RUNNER_TEMP/hello.log"; then
+              echo "a download failed (try $i), trying again"; sleep $((i * 60)); continue
+            fi
             grep -E "^e: |error:|FAILED|What went wrong|Could not" "$RUNNER_TEMP/hello.log" | head -40; exit 1
-          fi
+          done
           ls -la app/build/outputs/apk/debug/ app/build/outputs/apk/androidTest/debug/
           # Android keeps the libraries inside this app's APK (no useLegacyPackaging): the kit must find its CPU build there
           unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -E "lib/x86_64/libggml-cpu" | head -3
 
       - name: Test model (Qwen3 0.6B)
         run: |
-          curl -sfL -o "$RUNNER_TEMP/model.gguf" \
+          curl -sfL --retry 6 --retry-all-errors --retry-delay 30 -o "$RUNNER_TEMP/model.gguf" \
             https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf
           ls -la "$RUNNER_TEMP/model.gguf"
 

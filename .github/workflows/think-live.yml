@@ -104,7 +104,8 @@ jobs:
           print(f"{label}: limit={limit} finish={out['choices'][0].get('finish_reason')} thinking_chars={len(think)} budget={budget} "
                 f"closed_with_qwen_sentence={'limited time by the user' in think}")
           print(f"{label} answer: {answer[:300]!r}")
-          print(f"RESULT {label} {'ANSWER' if answer and not answer.lower().startswith(('okay, the user', 'okay, so')) else 'NO_ANSWER'}")
+          rambling = answer.lower().startswith(("okay", "hmm", "the user", "let me", "alright", "so,", "wait", "first,"))
+          print(f"RESULT {label} {'ANSWER' if answer and not rambling else 'NO_ANSWER'}")
           PY
           export PATH="$HOME/.ramen/bin:$PATH"
           ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1 > /dev/null || { tail -40 ~/.context-engine/*.log; exit 1; }

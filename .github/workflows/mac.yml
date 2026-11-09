@@ -96,6 +96,21 @@ jobs:
           tail -25 ~/.context-engine/llama-server.log
           [ "$how" = "restored" ] || { echo "the chat was not restored after a restart ($how)"; exit 1; }
           if grep -q 'needs a licensed RAMen' ~/.context-engine/*.log; then echo 'the engine did not accept the unlock'; exit 1; fi
+          # Sleep, the default (study and remember): a conversation with a fact, a night, then the question with the lookup
+          ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1 >/dev/null || { echo "FAILED: ""start for Sleep"; exit 1; }
+          fact='{"messages":[{"role":"user","content":"My cat is called Zorblax and she is 4 years old. What do cats like to play with?"}],"max_tokens":40,"temperature":0}'
+          curl -sf -o /dev/null -H 'Content-Type: application/json' -d "$fact" http://127.0.0.1:8090/v1/chat/completions || { echo "FAILED: ""Sleep: the conversation"; exit 1; }
+          ramen stop >/dev/null
+          t=$(date +%s); ramen sleep || { tail -40 ~/.context-engine/sleep/llama-server.log; echo "FAILED: ramen sleep"; exit 1; }
+          echo "Sleep took $(( $(date +%s) - t )) s"; ramen sleep --status
+          ramen start "$RUNNER_TEMP/q.gguf" --ctx 8192 --slots 1 >/dev/null || { echo "FAILED: ""start after Sleep"; exit 1; }
+          q='{"messages":[{"role":"user","content":"What is my cat called?"}],"max_tokens":30,"temperature":0}'
+          curl -sf -D h3.txt -o r3.json -H 'Content-Type: application/json' -d "$q" http://127.0.0.1:8090/v1/chat/completions || { echo "FAILED: ""Sleep: the question"; exit 1; }
+          ramen stop >/dev/null
+          echo "after Sleep: $(grep -i x-ce-recall h3.txt | tr -d '\r') $(head -c 300 r3.json)"
+          grep -qi '^x-ce-recall' h3.txt || { echo "FAILED: ""Sleep: no notes went with the question"; exit 1; }
+          grep -qi zorblax r3.json || { echo "FAILED: ""Sleep: the answer does not have the cat's name"; exit 1; }
+          echo "SLEEP TEST PASSED"
           echo "MAC TEST PASSED"
 
       - uses: actions/upload-artifact@v4

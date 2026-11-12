@@ -1,0 +1,98 @@
+name: linux-arm-cuda
+
+# The NVIDIA package for Linux on ARM: DGX Spark (GB10, sm_121 through the sm_120 PTX), Grace Hopper (sm_90) and
+# Jetson Orin (sm_87). llama-server is compiled with CUDA 12.8 for aarch64 on GitHub's free ARM runner, from the same
+# llama.cpp tag and RAMen engine patch as release/modal_linux.py builds for x64, with the CUDA runtime libraries it
+# needs next to it (cudart, cuBLAS, cuBLASLt), so only the NVIDIA driver must be installed. The runner has no GPU:
+# this checks the build, the package and the ramen app; running on a real NVIDIA GPU is the remaining test.
+#
+# Same rules as linux.yml: this repository is public so builds use GitHub's free runners. It holds no source code:
+# the build fetches RAMen's private repository with a read-only deploy key (secret CONTEXT_ENGINE_KEY) that is not
+# kept after the checkout. Only the owner can start a build (manual runs only).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "which commit, branch or tag of RAMen to build"
+        default: "main"
+      tag:
+        description: "the llama.cpp tag RAMen's engine patch is for"
+        default: "v0.9.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    container: nvidia/cuda:12.8.0-devel-ubuntu22.04      # glibc 2.35, as the other Linux packages
+    timeout-minutes: 300
+    steps:
+      - name: Tools
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git cmake build-essential python3 python3-pip \
+              python3-dev patchelf curl ca-certificates binutils openssh-client > /dev/null
+
+      - uses: actions/checkout@v4
+        with:
+          repository: MatthewLeibel/context-engine
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CONTEXT_ENGINE_KEY }}
+          persist-credentials: false
+          path: src
+
+      - name: llama-server with CUDA for ARM
+        run: |
+          git clone -q --depth 1 --branch "${{ inputs.tag }}" https://github.com/ggml-org/llama.cpp
+          python3 src/release2/apply_patch.py llama.cpp
+          # no OpenMP, OpenSSL or NCCL, as the x64 packages (they are missing on many installs)
+          cmake -S llama.cpp -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
+                -DLLAMA_BUILD_TESTS=OFF -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF -DGGML_OPENMP=OFF \
+                -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF "-DCMAKE_CUDA_ARCHITECTURES=87-real;90-real;120-real;120-virtual" \
+                -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined > cmake.log || { tail -40 cmake.log; exit 1; }
+          cmake --build build -j "$(nproc)" --target llama-server > build.log 2>&1 || { tail -60 build.log; exit 1; }
+          ls -la build/bin/llama-server
+
+      - name: The ramen app
+        run: |
+          python3 -m pip install -q pyinstaller==6.11.1
+          python3 -m PyInstaller --onefile --name ramen --paths src/ce-server --collect-submodules ce_server \
+              --distpath app --workpath pyi --specpath pyi --log-level WARN src/ce-server/ramen_entry.py
+          ./app/ramen version
+
+      - name: Package
+        run: |
+          P=pkg/ramen; mkdir -p $P/bin dist
+          cp build/bin/llama-server app/ramen $P/bin/
+          cp llama.cpp/LICENSE $P/LICENSE-llama.cpp.txt; cp src/legal/EULA.md $P/EULA.md
+          for lib in $(ldd build/bin/llama-server | awk '/libcudart|libcublas/ {print $3}'); do
+              cp -L "$lib" $P/bin/"$(basename "$lib")"
+          done
+          patchelf --set-rpath '$ORIGIN' $P/bin/llama-server
+          printf 'This package includes NVIDIA CUDA runtime libraries (cudart, cuBLAS, cuBLASLt), redistributed under the\nNVIDIA CUDA Toolkit End User License Agreement: https://docs.nvidia.com/cuda/eula/\n' > $P/CUDA-NOTICE.txt
+          tar -C pkg -czf dist/ramen-linux-arm64-cuda.tar.gz ramen
+          (cd dist && sha256sum ramen-linux-arm64-cuda.tar.gz | awk '{print $1}' > ramen-linux-arm64-cuda.tar.gz.sha256)
+          ls -la dist $P/bin
+          echo "glibc needed by llama-server: $(objdump -T $P/bin/llama-server | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)"
+
+      - name: Only the libraries every Linux has, and the driver's
+        run: |
+          SYSTEM=" libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 ld-linux-aarch64.so.1 libstdc++.so.6 libgcc_s.so.1 libz.so.1 libcuda.so.1 "
+          bad=0
+          for f in pkg/ramen/bin/*; do
+              for lib in $(readelf -d "$f" 2>/dev/null | awk '/NEEDED/ {gsub(/[\[\]]/, "", $5); print $5}'); do
+                  case "$SYSTEM" in *" $lib "*) continue;; esac
+                  [ -e "pkg/ramen/bin/$lib" ] || { echo "$(basename "$f") needs $lib, which is neither part of Linux nor in the package"; bad=1; }
+              done
+          done
+          [ $bad = 0 ] && echo "every library is part of Linux, comes with the NVIDIA driver (libcuda) or is in the package"
+          exit $bad
+
+      - name: Starts without a GPU (the ramen app; llama-server needs the driver)
+        run: |
+          ./pkg/ramen/bin/ramen version
+          ./pkg/ramen/bin/ramen start --help | grep -q -- "--lean-history" && echo "ramen start knows --lean-history"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ramen-linux-arm64-cuda
+          path: dist/
+          retention-days: 14
